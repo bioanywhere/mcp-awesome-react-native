@@ -1,0 +1,260 @@
+name: Build and Deploy Container
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: mcp-awesome-react-native
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if source code already imported
+        id: check-import
+        run: |
+          # Check if src/ or package.json exists (indicating source already imported)
+          if [ -f "package.json" ] || [ -f "pyproject.toml" ] || [ -f "Cargo.toml" ] || [ -f "go.mod" ] || [ -d "src" ]; then
+            echo "SOURCE_IMPORTED=true" >> $GITHUB_OUTPUT
+            echo "Source code already imported, skipping clone"
+          else
+            echo "SOURCE_IMPORTED=false" >> $GITHUB_OUTPUT
+            echo "Source code not yet imported, will clone from upstream"
+          fi
+
+      - name: Clone original source repository
+        if: steps.check-import.outputs.SOURCE_IMPORTED == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: jondot/awesome-react-native
+          ref: master
+          path: upstream-source
+
+      - name: Import source code to repository
+        if: steps.check-import.outputs.SOURCE_IMPORTED == 'false'
+        run: |
+          echo "=== Importing source code from jondot/awesome-react-native ==="
+          
+          # Copy all source files (excluding .git and .github to avoid workflow permission issues)
+          cd upstream-source
+          find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name '.github' -exec cp -r {} ../ \;
+          cd ..
+          
+          # Remove the upstream-source directory
+          rm -rf upstream-source
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Commit the source code
+          git add -A
+          IMPORT_DATE=$(date -u +%Y-%m-%d)
+          git commit -m "feat: Import source from jondot/awesome-react-native" -m "Branch: master, Date: $IMPORT_DATE"
+          
+          # Push the commit
+          git push origin main
+          
+          echo "=== Source code imported successfully ==="
+
+      - name: Detect Dockerfile or generate fallback
+        id: dockerfile
+        run: |
+          echo "=== Checking for Dockerfile ==="
+          
+          if [ -f "Dockerfile" ]; then
+            echo "DOCKERFILE_SOURCE=existing" >> $GITHUB_OUTPUT
+            echo "Using existing Dockerfile from source repository"
+            cat Dockerfile
+          else
+            echo "DOCKERFILE_SOURCE=generated" >> $GITHUB_OUTPUT
+            echo "No Dockerfile found, generating fallback..."
+            
+            if [ -f "package.json" ]; then
+              echo "Detected: Node.js project"
+              
+              MAIN=$(jq -r '.main // "index.js"' package.json 2>/dev/null || echo "index.js")
+              HAS_BUILD=$(jq -r '.scripts.build // empty' package.json 2>/dev/null)
+              HAS_START=$(jq -r '.scripts.start // empty' package.json 2>/dev/null)
+              
+              if [ -f "pnpm-lock.yaml" ]; then
+                PKG_MGR="pnpm"
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "RUN corepack enable"
+                  echo "COPY package.json pnpm-lock.yaml ./"
+                  echo "RUN pnpm install --frozen-lockfile"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN pnpm run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["pnpm", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              elif [ -f "yarn.lock" ]; then
+                PKG_MGR="yarn"
+                # Yarn Berry (v2+) requires all files including .yarn dir for install
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "RUN corepack enable"
+                  echo "COPY . ."
+                  echo "RUN yarn install --immutable"
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN yarn build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["yarn", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              elif [ -f "bun.lockb" ]; then
+                PKG_MGR="bun"
+                {
+                  echo "FROM oven/bun:latest"
+                  echo "WORKDIR /app"
+                  echo "COPY package.json bun.lockb ./"
+                  echo "RUN bun install --frozen-lockfile"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN bun run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["bun", "start"]'
+                  else echo "CMD [\"bun\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              else
+                PKG_MGR="npm"
+                {
+                  echo "FROM node:20-alpine"
+                  echo "WORKDIR /app"
+                  echo "COPY package*.json ./"
+                  echo "RUN npm ci || npm install"
+                  echo "COPY . ."
+                  if [ -n "$HAS_BUILD" ]; then echo "RUN npm run build"; fi
+                  if [ -n "$HAS_START" ]; then echo 'CMD ["npm", "start"]'
+                  else echo "CMD [\"node\", \"$MAIN\"]"; fi
+                } > Dockerfile
+              fi
+              
+            elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+              echo "Detected: Python project"
+              
+              if [ -f "main.py" ]; then ENTRY="main.py"
+              elif [ -f "app.py" ]; then ENTRY="app.py"
+              elif [ -f "server.py" ]; then ENTRY="server.py"
+              else ENTRY="main.py"; fi
+              
+              {
+                echo "FROM python:3.11-slim"
+                echo "WORKDIR /app"
+                echo "COPY requirements.txt* pyproject.toml* ./"
+                # Install from requirements.txt if exists, otherwise from pyproject.toml
+                # Don't hide errors with 2>/dev/null or || true
+                if [ -f "requirements.txt" ]; then
+                  echo "RUN pip install --no-cache-dir -r requirements.txt"
+                elif [ -f "pyproject.toml" ]; then
+                  echo "RUN pip install --no-cache-dir ."
+                fi
+                echo "COPY . ."
+                echo "CMD [\"python\", \"$ENTRY\"]"
+              } > Dockerfile
+              
+            elif [ -f "go.mod" ]; then
+              echo "Detected: Go project"
+              {
+                echo "FROM golang:1.21-alpine AS builder"
+                echo "WORKDIR /app"
+                echo "COPY go.mod go.sum* ./"
+                echo "RUN go mod download"
+                echo "COPY . ."
+                echo "RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ."
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo 'COPY --from=builder /app/server .'
+                echo 'CMD ["./server"]'
+              } > Dockerfile
+              
+            elif [ -f "Cargo.toml" ]; then
+              echo "Detected: Rust project"
+              {
+                echo "FROM rust:1.75-alpine AS builder"
+                echo "RUN apk add --no-cache musl-dev"
+                echo "WORKDIR /app"
+                echo "COPY . ."
+                echo "RUN cargo build --release"
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo 'COPY --from=builder /app/target/release/* ./'
+                echo 'CMD ["./app"]'
+              } > Dockerfile
+              
+            else
+              echo "Unknown project type, creating minimal Dockerfile"
+              {
+                echo "FROM alpine:latest"
+                echo "WORKDIR /app"
+                echo "COPY . ."
+                echo 'CMD ["/bin/sh", "-c", "echo Container started"]'
+              } > Dockerfile
+            fi
+            
+            echo "=== Generated Dockerfile ==="
+            cat Dockerfile
+          fi
+          echo "=== Build ready ==="
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=MCP Server Docker Image
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
